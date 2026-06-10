@@ -896,24 +896,8 @@ export default function App(){
                     const hrs=Math.floor(remaining/3600000);
                     const mins=Math.floor((remaining%3600000)/60000);
                     const isDefender=a.defenderIdx===myNatIdx;
-                    const [addDefFund,setAddDefFund]=useState("");
                     return(
-                      <div key={a.id} style={{background:"#030d03",border:"1px solid #FF2D5544",borderRadius:6,padding:"10px",marginBottom:8}}>
-                        <div style={{fontSize:11,marginBottom:4}}>
-                          <span style={{color:atkNat?.color}}>{atkNat?.name}</span>
-                          <span style={{color:"#666"}}> → </span>
-                          <span style={{color:defNat?.color||"#888"}}>{defNat?.name||"未開地"}</span>
-                        </div>
-                        <div style={{fontSize:10,color:"#2a5a2a",marginBottom:isDefender?8:0}}>
-                          残り {hrs}時間{mins}分 | 防衛資金:{(a.defenseFund||0).toLocaleString()}💰
-                        </div>
-                        {isDefender&&(
-                          <div style={{display:"flex",gap:6}}>
-                            <input type="number" placeholder="上乗せ資金" value={addDefFund} onChange={e=>setAddDefFund(e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:11}}/>
-                            <button className="btn" style={{padding:"4px 10px",fontSize:11}} onClick={()=>{addDefense(a.id,addDefFund);setAddDefFund("");}}>防衛強化</button>
-          </div>
-                        )}
-                      </div>
+                      <AttackCard key={a.id} a={a} atkNat={atkNat} defNat={defNat} hrs={hrs} mins={mins} isDefender={isDefender} onDefend={addDefense}/>
                     );
                   })}
                 </div>
