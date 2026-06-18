@@ -4,7 +4,9 @@ const FB = "https://studytoon-dad1f-default-rtdb.firebaseio.com/st3";
 const MW = 180, MH = 90, CELL = 7;
 const FUND_PER_MIN = 1000 / 60;
 const MINS_PER_CELL = 60;
-const ATTACK_RESOLVE_MS = 24 * 60 * 60 * 1000; // 24時間
+const ATTACK_RESOLVE_MS = 24 * 60 * 60 * 1000;
+const INCOME_PER_100TILES_PER_HOUR = 100; // 100マスで100💰/時間
+const SYNC_INTERVAL = 5000; // 5秒ごとにsync
 
 async function fbGet(path) {
   try { const r = await fetch(`${FB}/${path}.json`); return await r.json(); } catch { return null; }
@@ -12,11 +14,7 @@ async function fbGet(path) {
 async function fbSet(path, data) {
   try { await fetch(`${FB}/${path}.json`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data) }); return true; } catch { return false; }
 }
-async function fbPatch(path, data) {
-  try { await fetch(`${FB}/${path}.json`, { method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data) }); return true; } catch { return false; }
-}
 
-// ─── 世界地図 ─────────────────────────────────────────
 const RAW_MAP = (() => {
   const land = new Uint8Array(MW * MH);
   const rects = [
@@ -50,9 +48,7 @@ const REGION_LABELS=[
   {name:"東南アジア",x:128,y:44},{name:"オセアニア",x:136,y:64},
 ];
 
-// ─── 都市（50都市）────────────────────────────────────
 const POI=[
-  // 大都市 🏙
   {id:"tokyo",   name:"東京",        x:144,y:22,icon:"🏙",income:2000},
   {id:"ny",      name:"NY",          x:28, y:22,icon:"🏙",income:2000},
   {id:"london",  name:"ロンドン",    x:76, y:15,icon:"🏙",income:2000},
@@ -83,7 +79,6 @@ const POI=[
   {id:"warsaw",  name:"ワルシャワ",  x:86, y:14,icon:"🏙",income:1200},
   {id:"vienna",  name:"ウィーン",    x:84, y:18,icon:"🏙",income:1200},
   {id:"stockholm",name:"ストックホルム",x:84,y:8,icon:"🏙",income:1200},
-  // 海峡・港 ⚓
   {id:"sing",    name:"シンガポール",x:130,y:48,icon:"⚓",income:1800},
   {id:"cairo",   name:"スエズ",      x:90, y:32,icon:"⚓",income:1800},
   {id:"hormuz",  name:"ホルムズ",    x:102,y:34,icon:"⚓",income:1600},
@@ -94,7 +89,6 @@ const POI=[
   {id:"dover",   name:"ドーバー",    x:76, y:14,icon:"⚓",income:1200},
   {id:"taiwan",  name:"台湾海峡",    x:138,y:26,icon:"⚓",income:1400},
   {id:"capetown",name:"喜望峰",      x:80, y:72,icon:"⚓",income:1200},
-  // 資源地帯 ⛏
   {id:"dubai",   name:"ペルシャ湾",  x:100,y:36,icon:"⛏",income:1500},
   {id:"amazon",  name:"アマゾン",    x:26, y:52,icon:"⛏",income:1200},
   {id:"congo",   name:"コンゴ資源",  x:82, y:56,icon:"⛏",income:1000},
@@ -103,7 +97,7 @@ const POI=[
   {id:"canada_r",name:"カナダ資源",  x:18, y:12,icon:"⛏",income:1000},
   {id:"australia_r",name:"豪州資源", x:136,y:68,icon:"⛏",income:1000},
   {id:"caspian", name:"カスピ海",    x:100,y:24,icon:"⛏",income:1200},
-  {id:"nigeria", name:"ナイジェリア資源",x:76,y:50,icon:"⛏",income:1000},
+  {id:"nigeria", name:"ナイジェリア",x:76, y:50,icon:"⛏",income:1000},
   {id:"andes",   name:"アンデス",    x:22, y:60,icon:"⛏",income:800},
 ];
 
@@ -125,10 +119,7 @@ function nbrs(idx){
   if(y>0)r.push(idx-MW);if(y<MH-1)r.push(idx+MW);
   return r;
 }
-function dist(idx1,idx2){
-  const x1=idx1%MW,y1=Math.floor(idx1/MW),x2=idx2%MW,y2=Math.floor(idx2/MW);
-  return Math.abs(x1-x2)+Math.abs(y1-y2);
-}
+
 function expandTerritory(owned,ni,sx,sy,cells){
   const front=[];
   for(let i=0;i<MW*MH;i++){
@@ -148,6 +139,43 @@ function expandTerritory(owned,ni,sx,sy,cells){
   return added;
 }
 
+// 領土収益計算（経過時間分）
+function calcIncome(nations, owned, lastLoginTime) {
+  const now = Date.now();
+  const elapsedHours = (now - lastLoginTime) / (1000 * 60 * 60);
+  if (elapsedHours < 0.01) return { newNations: nations, incomeLog: [] };
+  const incomeLog = [];
+  const newNations = nations.map((n, ni) => {
+    const tiles = Array.from(owned).filter(v => v === ni).length;
+    const tileIncome = Math.floor((tiles / 100) * INCOME_PER_100TILES_PER_HOUR * elapsedHours);
+    const poiIncome = POI.filter(p => owned[p.y * MW + p.x] === ni)
+      .reduce((s, p) => s + Math.floor(p.income / 24 * elapsedHours), 0);
+    const total = tileIncome + poiIncome;
+    if (total > 0) incomeLog.push(`${n.name} +${total.toLocaleString()}💰（${elapsedHours.toFixed(1)}時間分の収益）`);
+    return total > 0 ? { ...n, fund: n.fund + total } : n;
+  });
+  return { newNations, incomeLog };
+}
+
+function resolveAttack(a, nats, ow) {
+  const atkNat = nats[a.attackerIdx];
+  const defNat = a.defenderIdx >= 0 ? nats[a.defenderIdx] : null;
+  const defFund = a.defenseFund || (defNat ? Math.floor(defNat.defenseBudget || 0) : 0);
+  const win = a.attackFund > defFund;
+  const newNats = [...nats];
+  const newOwned = new Int8Array(ow);
+  if (win) {
+    newOwned[a.cellIdx] = a.attackerIdx;
+    const loot = Math.floor(defFund * 0.3);
+    newNats[a.attackerIdx] = { ...newNats[a.attackerIdx], fund: Math.max(0, newNats[a.attackerIdx].fund + loot) };
+    if (a.defenderIdx >= 0) newNats[a.defenderIdx] = { ...newNats[a.defenderIdx], fund: Math.max(0, newNats[a.defenderIdx].fund - loot) };
+    const poi = POI.find(p => p.x === a.cellIdx % MW && p.y === Math.floor(a.cellIdx / MW));
+    return { nations: newNats, owned: newOwned, news: `【制圧】${atkNat?.name}が${defNat ? defNat.name + "の領土" : "未開地"}を制圧！${poi ? ` — ${poi.name}獲得` : ""}` };
+  } else {
+    return { nations: newNats, owned: newOwned, news: `【防衛成功】${defNat?.name || "未開地"}、${atkNat?.name}の侵攻を撃退！` };
+  }
+}
+
 const CP=[[0,1,0,1,0],[1,1,1,1,1],[1,2,1,2,1],[0,1,1,1,0],[0,1,3,1,0],[0,2,2,2,0]];
 function drawCastle(ctx,px,py,col,drk,s){
   CP.forEach((row,dy)=>row.forEach((v,dx)=>{
@@ -156,121 +184,123 @@ function drawCastle(ctx,px,py,col,drk,s){
     ctx.fillRect(px+dx*s,py+dy*s,s,s);
   }));
 }
-
 const COLORS=["#00FF9C","#FF6B35","#00B4FF","#CC44FF","#FFD700","#FF2D55","#FF88FF","#88FFFF"];
 function mkDark(hex){
   const h=hex.replace("#","");
   return"#"+[0,2,4].map(i=>Math.floor(parseInt(h.slice(i,i+2),16)*.55).toString(16).padStart(2,"0")).join("");
 }
 
+function AttackCard({a,atkNat,defNat,hrs,mins,isDefender,onDefend}){
+  const [addDefFund,setAddDefFund]=useState("");
+  return(
+    <div style={{background:"#030d03",border:"1px solid #FF2D5544",borderRadius:6,padding:"10px",marginBottom:8}}>
+      <div style={{fontSize:11,marginBottom:4}}>
+        <span style={{color:atkNat?.color}}>{atkNat?.name}</span>
+        <span style={{color:"#666"}}> → </span>
+        <span style={{color:defNat?.color||"#888"}}>{defNat?.name||"未開地"}</span>
+      </div>
+      <div style={{fontSize:10,color:"#2a5a2a",marginBottom:isDefender?8:0}}>
+        残り {hrs}時間{mins}分 | 防衛資金:{(a.defenseFund||0).toLocaleString()}💰
+      </div>
+      {isDefender&&(
+        <div style={{display:"flex",gap:6}}>
+          <input type="number" placeholder="上乗せ資金" value={addDefFund} onChange={e=>setAddDefFund(e.target.value)} style={{flex:1,padding:"4px 8px",fontSize:11}}/>
+          <button className="btn" style={{padding:"4px 10px",fontSize:11}} onClick={()=>{onDefend(a.id,addDefFund);setAddDefFund("");}}>防衛強化</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App(){
   const cvs=useRef(null);
   const [loaded,setLoaded]=useState(false);
   const [screen,setScreen]=useState("join");
-  const [allPlayers,setAllPlayers]=useState([]); // 全プレイヤー履歴
+  const [allPlayers,setAllPlayers]=useState([]);
   const [myPlayer,setMyPlayer]=useState(null);
   const [nations,setNations]=useState([]);
   const [owned,setOwned]=useState(()=>new Int8Array(MW*MH).fill(-1));
-  const [attacks,setAttacks]=useState([]); // 進行中の戦闘
+  const [attacks,setAttacks]=useState([]);
   const [newsLog,setNewsLog]=useState(["【速報】世界大戦、勃発——勉強せよ"]);
   const [zoom,setZoom]=useState(2);
   const [cam,setCam]=useState({x:MW/2,y:MH/2});
   const [hovPoi,setHovPoi]=useState(null);
-  // join
   const [joinTab,setJoinTab]=useState("returning");
   const [joinName,setJoinName]=useState("");
   const [joinNatId,setJoinNatId]=useState(null);
   const [newNName,setNewNName]=useState("");
   const [newNColor,setNewNColor]=useState("#00FF9C");
-  // placing
   const [pendingNat,setPendingNat]=useState(null);
   const [pendingP,setPendingP]=useState(null);
   const [hoverCell,setHoverCell]=useState(null);
-  // record
   const [inputH,setInputH]=useState("");
   const [inputM,setInputM]=useState("");
   const [inputSubj,setInputSubj]=useState("");
-  // attack
   const [atkMode,setAtkMode]=useState(false);
   const [atkTarget,setAtkTarget]=useState(null);
   const [atkFund,setAtkFund]=useState("");
-  // defense
   const [defBudget,setDefBudget]=useState("");
   const [syncing,setSyncing]=useState(false);
+  const [incomeAlert,setIncomeAlert]=useState(null); // ログイン時収益通知
   const drag=useRef({on:false,sx:0,sy:0,cx:0,cy:0,moved:false});
+  const lastSyncRef=useRef(0);
 
-  // ─── Firebase ────────────────────────────────────────
-  useEffect(()=>{loadAll();},[]);
-  useEffect(()=>{const iv=setInterval(loadAll,30000);return()=>clearInterval(iv);},[]);
+  useEffect(()=>{loadAll(true);},[]);
+  useEffect(()=>{
+    const iv=setInterval(()=>loadAll(false),SYNC_INTERVAL);
+    return()=>clearInterval(iv);
+  },[]);
 
-  async function loadAll(){
+  async function loadAll(isFirstLoad){
+    if(!isFirstLoad && Date.now()-lastSyncRef.current < SYNC_INTERVAL-500) return;
+    lastSyncRef.current=Date.now();
     const data=await fbGet("");
-    if(data){
-      if(data.nations)setNations(data.nations);
-      if(data.owned)setOwned(new Int8Array(data.owned));
-      if(data.news)setNewsLog(data.news);
-      if(data.players)setAllPlayers(data.players);
-      if(data.attacks){
-        const atks=data.attacks;
-        // 24時間チェック
-        const now=Date.now();
-        const pending=atks.filter(a=>!a.resolved);
-        const toResolve=pending.filter(a=>now-a.timestamp>=ATTACK_RESOLVE_MS);
-        if(toResolve.length>0){
-          let newNats=[...(data.nations||[])];
-          let newOwned=new Int8Array(data.owned||new Array(MW*MH).fill(-1));
-          let newNews=[...(data.news||[])];
-          for(const a of toResolve){
-            const result=resolveAttack(a,newNats,newOwned);
-            newNats=result.nations;
-            newOwned=result.owned;
-            newNews=[result.news,...newNews.slice(0,49)];
-          }
-          const resolvedAtks=atks.map(a=>toResolve.find(r=>r.id===a.id)?{...a,resolved:true}:a);
-          await saveAll(newNats,newOwned,newNews,data.players||[],resolvedAtks);
-          setNations(newNats);setOwned(newOwned);setNewsLog(newNews);setAttacks(resolvedAtks);
-        } else {
-          setAttacks(atks);
-        }
+    if(!data){setLoaded(true);return;}
+    let nats=data.nations||[];
+    let ow=new Int8Array(data.owned||new Array(MW*MH).fill(-1));
+    let nl=data.news||["【速報】世界大戦、勃発——勉強せよ"];
+    let pl=data.players||[];
+    let atks=data.attacks||[];
+    const now=Date.now();
+
+    // 24時間経過した戦闘を解決
+    const toResolve=atks.filter(a=>!a.resolved&&now-a.timestamp>=ATTACK_RESOLVE_MS);
+    if(toResolve.length>0){
+      for(const a of toResolve){
+        const result=resolveAttack(a,nats,ow);
+        nats=result.nations; ow=result.owned;
+        nl=[result.news,...nl.slice(0,49)];
+      }
+      atks=atks.map(a=>toResolve.find(r=>r.id===a.id)?{...a,resolved:true}:a);
+      await fbSet("",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
+    }
+
+    // ログイン時収益（初回ロードのみ）
+    if(isFirstLoad && data.lastUpdate){
+      const {newNations,incomeLog}=calcIncome(nats,ow,data.lastUpdate);
+      if(incomeLog.length>0){
+        nats=newNations;
+        const incomeNews=incomeLog.map(l=>`【収益】${l}`);
+        nl=[...incomeNews,...nl.slice(0,49)];
+        setIncomeAlert(incomeLog);
+        setTimeout(()=>setIncomeAlert(null),8000);
+        await fbSet("",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
+      } else {
+        await fbSet("lastUpdate",now);
       }
     }
-    setLoaded(true);
-  }
 
-  function resolveAttack(a,nats,ow){
-    const atkNat=nats[a.attackerIdx];
-    const defNat=a.defenderIdx>=0?nats[a.defenderIdx]:null;
-    const atkFundVal=a.attackFund;
-    const defFundVal=a.defenseFund||(defNat?Math.floor(defNat.defenseBudget||0):0);
-    const win=atkFundVal>defFundVal;
-    const newNats=[...nats];
-    const newOwned=new Int8Array(ow);
-    if(win){
-      newOwned[a.cellIdx]=a.attackerIdx;
-      const loot=Math.floor(defFundVal*0.3);
-      newNats[a.attackerIdx]={...newNats[a.attackerIdx],fund:Math.max(0,newNats[a.attackerIdx].fund+loot)};
-      if(a.defenderIdx>=0)newNats[a.defenderIdx]={...newNats[a.defenderIdx],fund:Math.max(0,newNats[a.defenderIdx].fund-loot)};
-      const poi=POI.find(p=>p.x===a.cellIdx%MW&&p.y===Math.floor(a.cellIdx/MW));
-      return{nations:newNats,owned:newOwned,news:`【制圧】${atkNat?.name}が${defNat?defNat.name+"の領土":"未開地"}を制圧！${poi?` — ${poi.name}獲得`:""}`};
-    } else {
-      return{nations:newNats,owned:newOwned,news:`【防衛成功】${defNat?.name||"未開地"}、${atkNat?.name}の侵攻を撃退！`};
-    }
+    setNations(nats);setOwned(ow);setNewsLog(nl);setAllPlayers(pl);setAttacks(atks);
+    setLoaded(true);
   }
 
   async function saveAll(nats,ow,nl,pl,atks){
     setSyncing(true);
-    const ok=await fbSet("",{
-      nations:nats,
-      owned:Array.from(ow),
-      news:nl.slice(0,50),
-      players:pl,
-      attacks:atks||[],
-    });
+    await fbSet("",{nations:nats,owned:Array.from(ow),news:nl.slice(0,50),players:pl,attacks:atks||[],lastUpdate:Date.now()});
     setSyncing(false);
-    return ok;
   }
 
-  function addNewsLocal(msg,nats,ow,nl,pl,atks){
+  function addNewsAndSave(msg,nats,ow,nl,pl,atks){
     const next=[msg,...nl.slice(0,49)];
     setNewsLog(next);
     saveAll(nats,ow,next,pl,atks||attacks);
@@ -283,7 +313,6 @@ export default function App(){
     return res;
   }
 
-  // ─── 拠点配置 ─────────────────────────────────────────
   function placeNation(sx,sy){
     if(!pendingNat||!pendingP)return;
     const nat={...pendingNat,sx,sy};
@@ -298,15 +327,13 @@ export default function App(){
     }
     const near=POI.find(c=>Math.abs(c.x-sx)<10&&Math.abs(c.y-sy)<10);
     const newPlayers=[...allPlayers.filter(p=>p.name!==pendingP.name),pendingP];
-    setAllPlayers(newPlayers);
-    const nl=addNewsLocal(`【建国】${nat.name}、${near?near.name+"付近":"未知の地"}に建国`,newNats,newO,newsLog,newPlayers);
-    setNations(newNats);setOwned(newO);
+    setAllPlayers(newPlayers);setNations(newNats);setOwned(newO);
+    addNewsAndSave(`【建国】${nat.name}、${near?near.name+"付近":"未知の地"}に建国`,newNats,newO,newsLog,newPlayers);
     setMyPlayer(pendingP);
     setPendingNat(null);setPendingP(null);setHoverCell(null);
     setCam({x:sx,y:sy});setZoom(4);setScreen("map");
   }
 
-  // ─── 参加 ─────────────────────────────────────────────
   function handleJoin(){
     if(!joinName.trim())return;
     if(joinTab==="new"){
@@ -334,13 +361,11 @@ export default function App(){
   function doJoin(nat){
     const p={name:joinName.trim(),nationId:nat.id,totalFund:0};
     const newPlayers=[...allPlayers.filter(x=>x.name!==p.name),p];
-    setAllPlayers(newPlayers);
-    setMyPlayer(p);
-    addNewsLocal(`【参戦】${p.name} → ${nat.name}`,nations,owned,newsLog,newPlayers);
+    setAllPlayers(newPlayers);setMyPlayer(p);
+    addNewsAndSave(`【参戦】${p.name} → ${nat.name}`,nations,owned,newsLog,newPlayers);
     setCam({x:nat.sx,y:nat.sy});setZoom(4);setScreen("map");
   }
 
-  // ─── 勉強申告 ─────────────────────────────────────────
   async function submitStudy(){
     const h=parseInt(inputH||"0"),m=parseInt(inputM||"0");
     const total=h*60+m;if(!total||!myPlayer)return;
@@ -357,12 +382,11 @@ export default function App(){
     setOwned(newO);setNations(newNats);setAllPlayers(newPlayers);
     setMyPlayer(prev=>({...prev,totalFund:newTF}));
     const subj=inputSubj?`[${inputSubj}]`:"";
-    addNewsLocal(`【拡張】${nat.name}${subj} +${added}マス（${h}h${m}m / +${earned.toLocaleString()}💰）`,newNats,newO,newsLog,newPlayers);
+    addNewsAndSave(`【拡張】${nat.name}${subj} +${added}マス（${h}h${m}m / +${earned.toLocaleString()}💰）`,newNats,newO,newsLog,newPlayers);
     setInputH("");setInputM("");setInputSubj("");
     setScreen("map");setCam({x:nat.sx,y:nat.sy});
   }
 
-  // ─── 防衛予算設定 ─────────────────────────────────────
   async function setDefenseBudget(){
     const budget=parseInt(defBudget||"0");
     const ni=nations.findIndex(n=>n.id===myPlayer?.nationId);
@@ -373,7 +397,6 @@ export default function App(){
     setDefBudget("");
   }
 
-  // ─── 侵攻宣言 ─────────────────────────────────────────
   async function declareAttack(){
     const fund=parseInt(atkFund||"0");
     if(!fund||fund<=0||!atkTarget||!myPlayer)return;
@@ -381,7 +404,6 @@ export default function App(){
     if(ni<0)return;
     const myNatData=nations[ni];
     if(myNatData.fund<fund){alert("資金不足");return;}
-    // 資金をロック
     const newNats=nations.map((n,i)=>i===ni?{...n,fund:n.fund-fund}:n);
     const newAtk={
       id:`atk_${Date.now()}`,
@@ -396,11 +418,10 @@ export default function App(){
     const newAtks=[...attacks,newAtk];
     setNations(newNats);setAttacks(newAtks);
     const defName=atkTarget.ownerIdx>=0?nations[atkTarget.ownerIdx]?.name:"未開地";
-    addNewsLocal(`【侵攻宣言】${myNatData.name}が${defName}に侵攻宣言！24時間以内に決着`,newNats,owned,newsLog,allPlayers,newAtks);
+    addNewsAndSave(`【侵攻宣言】${myNatData.name}が${defName}に侵攻宣言！24時間以内に決着`,newNats,owned,newsLog,allPlayers,newAtks);
     setAtkMode(false);setAtkTarget(null);setAtkFund("");
   }
 
-  // ─── 防衛上乗せ ───────────────────────────────────────
   async function addDefense(atkId,addFund){
     const fund=parseInt(addFund||"0");
     if(!fund||!myPlayer)return;
@@ -414,7 +435,6 @@ export default function App(){
     await saveAll(newNats,owned,newsLog,allPlayers,newAtks);
   }
 
-  // ─── 軍種解放 ─────────────────────────────────────────
   async function unlockMilitary(type){
     const ni=nations.findIndex(n=>n.id===myPlayer?.nationId);
     if(ni<0)return;
@@ -422,28 +442,23 @@ export default function App(){
     if(nations[ni].fund<cost)return;
     const newNats=nations.map((n,i)=>i===ni?{...n,fund:n.fund-cost,[type]:true}:n);
     setNations(newNats);
-    addNewsLocal(`【解放】${nations[ni].name}、${type==="navy"?"⚓海軍":"✈️空軍"}を創設！`,newNats,owned,newsLog,allPlayers);
+    addNewsAndSave(`【解放】${nations[ni].name}、${type==="navy"?"⚓海軍":"✈️空軍"}を創設！`,newNats,owned,newsLog,allPlayers);
   }
 
-  // ─── 攻撃可能マス判定 ─────────────────────────────────
   function getAttackable(ni,nats,ow){
     const myNatData=nats[ni];
     const attackable=new Set();
-    // 陸軍：隣接する敵マス
     for(let i=0;i<MW*MH;i++){
       if(ow[i]!==ni)continue;
       for(const nb of nbrs(i)){
         if(RAW_MAP[nb]&&ow[nb]!==ni)attackable.add(nb);
       }
     }
-    // 海軍：海を渡った先（簡易：海のマスを経由して到達できる陸）
     if(myNatData?.navy){
       for(let i=0;i<MW*MH;i++){
         if(ow[i]!==ni)continue;
-        // 海に接していれば遠くの陸も攻撃可（距離制限あり）
         const hasSeaNb=nbrs(i).some(nb=>!RAW_MAP[nb]);
         if(hasSeaNb){
-          // 半径15マス内の敵陸地
           const x0=i%MW,y0=Math.floor(i/MW);
           for(let dy=-15;dy<=15;dy++) for(let dx=-15;dx<=15;dx++){
             const nx=x0+dx,ny=y0+dy;
@@ -454,7 +469,6 @@ export default function App(){
         }
       }
     }
-    // 空軍：自国マスから射程内
     if(myNatData?.air){
       for(let i=0;i<MW*MH;i++){
         if(ow[i]!==ni)continue;
@@ -480,7 +494,6 @@ export default function App(){
   const attackable=atkMode&&myNatIdx>=0?getAttackable(myNatIdx,nations,owned):new Set();
   const pendingAtks=attacks.filter(a=>!a.resolved&&a.defenderIdx===myNatIdx);
 
-  // ─── Canvas ───────────────────────────────────────────
   useEffect(()=>{
     if(!cvs.current||(screen!=="map"&&screen!=="placing"))return;
     const canvas=cvs.current;
@@ -497,7 +510,6 @@ export default function App(){
       else{const n=nations[o];ctx.fillStyle=n?(x+y)%2===0?n.color+"cc":n.dark+"dd":"#333";}
       ctx.fillRect(px,py,s,s);
     }
-    // 国境
     for(let y=0;y<MH;y++) for(let x=0;x<MW;x++){
       const idx=y*MW+x;if(owned[idx]<0)continue;
       const px=ox+x*s,py=oy+y*s;
@@ -506,7 +518,6 @@ export default function App(){
       if(x<MW-1&&owned[idx+1]!==owned[idx]){ctx.fillStyle=col+"88";ctx.fillRect(px+s-1,py,1,s);}
       if(y<MH-1&&owned[(y+1)*MW+x]!==owned[idx]){ctx.fillStyle=col+"88";ctx.fillRect(px,py+s-1,s,1);}
     }
-    // 攻撃可能ハイライト
     if(atkMode){
       attackable.forEach(idx=>{
         const x=idx%MW,y=Math.floor(idx/MW);
@@ -516,7 +527,6 @@ export default function App(){
         ctx.strokeStyle="#FF2D55aa";ctx.lineWidth=0.5;ctx.strokeRect(px,py,s,s);
       });
     }
-    // 城
     if(s>=4)nations.forEach((n,i)=>{
       const px=ox+n.sx*s,py=oy+n.sy*s;
       if(px<-s*6||px>W+s*6||py<-s*6||py>H+s*6)return;
@@ -528,7 +538,6 @@ export default function App(){
         ctx.fillText(n.name,px-cs*2,py+cs*4);ctx.shadowBlur=0;
       }
     });
-    // 地域名
     if(s>=2){
       REGION_LABELS.forEach(l=>{
         const px=ox+l.x*s,py=oy+l.y*s;
@@ -538,7 +547,6 @@ export default function App(){
         ctx.fillText(l.name,px,py);
       });
     }
-    // POI
     POI.forEach(p=>{
       const px=ox+p.x*s,py=oy+p.y*s;
       if(px<-s*2||px>W+s*2||py<-s*2||py>H+s*2)return;
@@ -566,7 +574,7 @@ export default function App(){
       ctx.fillStyle="#00FF9C";ctx.font="bold 14px monospace";
       ctx.fillText(`🏰 ${pendingNat?.name} の拠点を陸地クリックで選択`,16,28);
     }
-    ctx.fillStyle="#00FF9C22";ctx.fillRect(W-95,H-22,88,14);
+    ctx.fillStyle=syncing?"#FFD70022":"#00FF9C22";ctx.fillRect(W-95,H-22,88,14);
     ctx.fillStyle=syncing?"#FFD700":"#00FF9C99";ctx.font="9px monospace";
     ctx.fillText(syncing?"● SYNCING":` x${zoom.toFixed(1)} ● LIVE`,W-90,H-11);
   },[owned,nations,zoom,cam,screen,hoverCell,pendingNat,poiOwner,hovPoi,atkMode,attackable,syncing]);
@@ -618,6 +626,7 @@ export default function App(){
     @keyframes slide{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
     @keyframes ticker{0%{transform:translateX(100%)}100%{transform:translateX(-200%)}}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+    @keyframes incomepop{0%{opacity:0;transform:translateY(20px)}10%{opacity:1;transform:translateY(0)}80%{opacity:1}100%{opacity:0;transform:translateY(-10px)}}
     .nb{background:transparent;border:1px solid #1a3a1a;color:#4a7a4a;border-radius:4px;padding:5px 12px;cursor:pointer;font-family:monospace;font-size:11px;font-weight:bold;transition:all 0.15s;letter-spacing:1px}
     .nb:hover,.nb.on{border-color:#00FF9C;color:#00FF9C;background:#00FF9C11}
     .btn{background:transparent;border:1px solid #00FF9C55;color:#00FF9C;border-radius:3px;padding:8px 18px;cursor:pointer;font-family:monospace;font-size:12px;font-weight:bold;transition:all 0.15s}
@@ -639,7 +648,6 @@ export default function App(){
     </div>
   );
 
-  // ─── JOIN ─────────────────────────────────────────────
   if(screen==="join")return(
     <div style={{minHeight:"100vh",background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
       <style>{css}</style>
@@ -653,8 +661,6 @@ export default function App(){
             <button key={t} className={`nb ${joinTab===t?"on":""}`} style={{flex:1,fontSize:10}} onClick={()=>setJoinTab(t)}>{l}</button>
           ))}
         </div>
-
-        {/* 再ログイン */}
         {joinTab==="returning"&&(
           <div className="panel">
             <div style={{fontSize:10,color:"#2a5a2a",marginBottom:12,letterSpacing:2}}>// 前回の指揮官を選択</div>
@@ -663,11 +669,11 @@ export default function App(){
               :allPlayers.map(p=>{
                 const n=nations.find(x=>x.id===p.nationId);
                 return(
-                  <button key={p.name} onClick={()=>resumePlayer(p)} style={{background:"#030d03",border:`2px solid ${n?.color||"#1a3a1a"}44`,borderRadius:6,padding:"12px 14px",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,width:"100%",marginBottom:8,transition:"all 0.15s"}}>
+                  <button key={p.name} onClick={()=>resumePlayer(p)} style={{background:"#030d03",border:`2px solid ${n?.color||"#1a3a1a"}44`,borderRadius:6,padding:"12px 14px",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,width:"100%",marginBottom:8}}>
                     {n&&<div style={{width:10,height:10,background:n.color,borderRadius:2,flexShrink:0}}/>}
                     <div>
                       <div style={{fontSize:13,fontWeight:900,color:n?.color||"#00FF9C"}}>{p.name}</div>
-                      <div style={{fontSize:10,color:"#2a5a2a",marginTop:2}}>{n?.name||"不明"} | 称号:{getTitle(p.totalFund||0).label}</div>
+                      <div style={{fontSize:10,color:"#2a5a2a",marginTop:2}}>{n?.name||"不明"} | {getTitle(p.totalFund||0).label}</div>
                     </div>
                     <div style={{marginLeft:"auto",fontSize:10,color:"#2a5a2a"}}>▶ 再開</div>
                   </button>
@@ -676,17 +682,14 @@ export default function App(){
             }
           </div>
         )}
-
-        {/* 既存国に参加 */}
         {joinTab==="existing"&&(
           <div>
             <div className="panel" style={{marginBottom:10}}>
-              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8,letterSpacing:2}}>// 指揮官名</div>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 指揮官名</div>
               <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)}/>
             </div>
             <div className="panel" style={{marginBottom:14}}>
-              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8,letterSpacing:2}}>// 国家選択</div>
-              <div style={{fontSize:10,color:"#333",marginBottom:10}}>※ 場所・戦力は参加後に公開</div>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 国家選択（場所・戦力は参加後に公開）</div>
               {nations.length===0
                 ?<div style={{color:"#2a5a2a",fontSize:11,textAlign:"center",padding:"12px"}}>まだ国家がありません</div>
                 :nations.map(n=>{
@@ -702,46 +705,46 @@ export default function App(){
               }
             </div>
             <button className="btn" style={{width:"100%",fontSize:14,padding:"13px"}} onClick={handleJoin}
-              disabled={!joinName.trim()||!joinNatId||nations.length===0}>
-              ▶ 参戦する
-            </button>
+              disabled={!joinName.trim()||!joinNatId||nations.length===0}>▶ 参戦する</button>
           </div>
         )}
-
-        {/* 建国 */}
         {joinTab==="new"&&(
           <div>
             <div className="panel" style={{marginBottom:10}}>
-              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8,letterSpacing:2}}>// 指揮官名</div>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 指揮官名</div>
               <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)}/>
             </div>
             <div className="panel" style={{marginBottom:14}}>
-              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10,letterSpacing:2}}>// 国家設立</div>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10}}>// 国家設立</div>
               <input type="text" placeholder="国家名（例：京大解放戦線）" value={newNName} onChange={e=>setNewNName(e.target.value)} style={{marginBottom:12}}/>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:6}}>国家カラー</div>
               <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10}}>
                 {COLORS.map(c=><button key={c} onClick={()=>setNewNColor(c)} style={{width:26,height:26,background:c,border:newNColor===c?"3px solid #fff":"3px solid transparent",borderRadius:3,cursor:"pointer"}}/>)}
               </div>
-              <div style={{fontSize:10,color:"#2a5a2a",background:"#030d03",border:"1px solid #1a3a1a",borderRadius:4,padding:"8px 10px"}}>
-                建国後、地図をクリックして拠点を選択
-              </div>
             </div>
             <button className="btn" style={{width:"100%",fontSize:14,padding:"13px"}} onClick={handleJoin}
-              disabled={!joinName.trim()||!newNName.trim()}>
-              🏰 建国して拠点を選ぶ
-            </button>
+              disabled={!joinName.trim()||!newNName.trim()}>🏰 建国して拠点を選ぶ</button>
           </div>
         )}
       </div>
     </div>
   );
 
-  // ─── MAIN ─────────────────────────────────────────────
   return(
     <div style={{height:"100vh",background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",flexDirection:"column",overflow:"hidden"}}>
       <style>{css}</style>
       <div style={{position:"fixed",inset:0,background:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,156,0.01) 2px,rgba(0,255,156,0.01) 4px)",pointerEvents:"none",zIndex:999}}/>
-      {/* ヘッダー */}
+
+      {/* ログイン時収益ポップアップ */}
+      {incomeAlert&&(
+        <div style={{position:"fixed",bottom:80,right:20,zIndex:9999,animation:"incomepop 8s ease forwards"}}>
+          <div style={{background:"#0a1f0a",border:"2px solid #FFD700",borderRadius:10,padding:"12px 16px",maxWidth:280}}>
+            <div style={{fontSize:11,color:"#FFD700",fontWeight:900,marginBottom:6}}>💰 収益が入りました！</div>
+            {incomeAlert.map((l,i)=><div key={i} style={{fontSize:10,color:"#00FF9C",lineHeight:1.6}}>{l}</div>)}
+          </div>
+        </div>
+      )}
+
       <div style={{background:"#030d03",borderBottom:"1px solid #1a3a1a",padding:"6px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
         <span style={{fontSize:13,fontWeight:900,letterSpacing:4}}>STUDYTOON</span>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
@@ -751,13 +754,13 @@ export default function App(){
           {syncing&&<span style={{fontSize:9,color:"#FFD700",animation:"pulse 1s infinite"}}>SYNC</span>}
         </div>
       </div>
-      {/* テロップ */}
+
       <div style={{background:"#0a0500",borderBottom:"1px solid #332200",padding:"4px 0",overflow:"hidden",flexShrink:0}}>
         <div style={{animation:"ticker 40s linear infinite",whiteSpace:"nowrap",fontSize:11,color:"#FFD700"}}>
           {[...newsLog,...newsLog].map((n,i)=><span key={i} style={{marginRight:48}}>◆ {n}</span>)}
         </div>
       </div>
-      {/* ナビ */}
+
       {screen!=="placing"&&(
         <div style={{background:"#030d03",borderBottom:"1px solid #1a3a1a",padding:"5px 14px",display:"flex",gap:6,flexShrink:0,flexWrap:"wrap"}}>
           {[["map","[ MAP ]"],["record","[ 記録 ]"],["military","[ 軍事 ]"],["rank","[ RANK ]"],["news","[ NEWS ]"],["help","[ HELP ]"]].map(([s,l])=>(
@@ -767,15 +770,14 @@ export default function App(){
             <button className={`nb ${atkMode?"on":""}`} style={{borderColor:"#FF2D5544",color:atkMode?"#FF2D55":"#884444"}} onClick={()=>{setAtkMode(v=>!v);setAtkTarget(null);}}>[ ⚔️侵攻 ]</button>
             <button className="nb" onClick={()=>{setCam({x:myNat?.sx||MW/2,y:myNat?.sy||MH/2});setZoom(4);}}>[ 自国 ]</button>
             <button className="nb" onClick={()=>{setCam({x:MW/2,y:MH/2});setZoom(1.5);}}>[ 全体 ]</button>
-            <button className="nb" onClick={loadAll}>[ 🔄 ]</button>
           </>}
           <button className="nb" style={{marginLeft:"auto"}} onClick={()=>setScreen("join")}>退出</button>
         </div>
       )}
-      {/* 侵攻パネル */}
+
       {atkMode&&atkTarget&&screen==="map"&&(
         <div style={{background:"#1a0505",borderBottom:"2px solid #FF2D55",padding:"8px 14px",display:"flex",alignItems:"center",gap:10,flexShrink:0,flexWrap:"wrap"}}>
-          <span style={{fontSize:11,color:"#FF2D55"}}>⚔️ 侵攻先: {atkTarget.ownerIdx>=0?nations[atkTarget.ownerIdx]?.name:"未開地"} ({atkTarget.x},{atkTarget.y})</span>
+          <span style={{fontSize:11,color:"#FF2D55"}}>⚔️ {atkTarget.ownerIdx>=0?nations[atkTarget.ownerIdx]?.name:"未開地"} への侵攻</span>
           <input type="number" placeholder="投入資金" value={atkFund} onChange={e=>setAtkFund(e.target.value)} style={{width:130,padding:"4px 8px",fontSize:12}}/>
           <button className="btn red" style={{padding:"5px 14px",fontSize:12}} onClick={declareAttack}>侵攻宣言（24h後解決）</button>
           <button className="nb" onClick={()=>{setAtkTarget(null);setAtkFund("");}}>×</button>
@@ -795,7 +797,6 @@ export default function App(){
             />
           )}
 
-          {/* 記録 */}
           {screen==="record"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:14,letterSpacing:2}}>// 勉強時間申告</div>
@@ -814,7 +815,7 @@ export default function App(){
                 <input type="text" placeholder="科目（任意）" value={inputSubj} onChange={e=>setInputSubj(e.target.value)} style={{marginBottom:12}}/>
                 <div style={{fontSize:10,color:"#2a5a2a",marginBottom:12,background:"#030d03",border:"1px solid #1a3a1a",borderRadius:4,padding:"8px 10px",lineHeight:1.9}}>
                   1時間 = 1,000💰 = 1マス拡張<br/>
-                  海軍:20,000💰 | 空軍:50,000💰 | 侵攻:3,000〜💰
+                  海軍:20,000💰 | 空軍:50,000💰
                 </div>
                 <button className="btn" style={{width:"100%",fontSize:14,padding:"12px"}} onClick={submitStudy}
                   disabled={!parseInt(inputH||"0")&&!parseInt(inputM||"0")}>
@@ -823,8 +824,8 @@ export default function App(){
               </div>
               {myNat&&(
                 <div className="panel" style={{marginBottom:12}}>
-                  <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8,letterSpacing:2}}>STATUS</div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                  <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>STATUS</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:myPOIs.length?10:0}}>
                     {[["NAME",myPlayer.name],["NATION",myNat.name],["FUNDS",`${myNat.fund.toLocaleString()}💰`],["TERRITORY",`${myTerritory}マス`],["称号",myTitle?.label||"-"],["累計",`${(myPlayer.totalFund||0).toLocaleString()}💰`]].map(([k,v])=>(
                       <div key={k} style={{background:"#030d03",border:"1px solid #1a3a1a",borderRadius:3,padding:"7px"}}>
                         <div style={{fontSize:9,color:"#2a5a2a"}}>{k}</div>
@@ -845,14 +846,10 @@ export default function App(){
                   )}
                 </div>
               )}
-              {/* 防衛予算設定 */}
               {myNat&&(
                 <div className="panel">
-                  <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8,letterSpacing:2}}>🛡 防衛予算設定</div>
-                  <div style={{fontSize:10,color:"#5a8a5a",marginBottom:8,lineHeight:1.6}}>
-                    現在: {(myNat.defenseBudget||0).toLocaleString()}💰<br/>
-                    侵攻を受けたとき自動で防衛に使われる
-                  </div>
+                  <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>🛡 防衛予算</div>
+                  <div style={{fontSize:10,color:"#5a8a5a",marginBottom:8}}>現在: {(myNat.defenseBudget||0).toLocaleString()}💰（侵攻時に自動防衛）</div>
                   <div style={{display:"flex",gap:8}}>
                     <input type="number" placeholder="防衛予算" value={defBudget} onChange={e=>setDefBudget(e.target.value)} style={{flex:1}}/>
                     <button className="btn" style={{padding:"8px 14px",fontSize:12}} onClick={setDefenseBudget}>設定</button>
@@ -862,7 +859,6 @@ export default function App(){
             </div>
           )}
 
-          {/* 軍事 */}
           {screen==="military"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:14,letterSpacing:2}}>// 軍事システム</div>
@@ -885,9 +881,8 @@ export default function App(){
                   )}
                 </div>
               ))}
-              {/* 進行中の戦闘 */}
               {attacks.filter(a=>!a.resolved).length>0&&(
-                <div className="panel" style={{marginTop:4}}>
+                <div className="panel">
                   <div style={{fontSize:10,color:"#FF2D55",marginBottom:10,letterSpacing:2}}>⚔️ 進行中の戦闘</div>
                   {attacks.filter(a=>!a.resolved).map(a=>{
                     const atkNat=nations[a.attackerIdx];
@@ -895,17 +890,13 @@ export default function App(){
                     const remaining=Math.max(0,ATTACK_RESOLVE_MS-(Date.now()-a.timestamp));
                     const hrs=Math.floor(remaining/3600000);
                     const mins=Math.floor((remaining%3600000)/60000);
-                    const isDefender=a.defenderIdx===myNatIdx;
-                    return(
-                      <AttackCard key={a.id} a={a} atkNat={atkNat} defNat={defNat} hrs={hrs} mins={mins} isDefender={isDefender} onDefend={addDefense}/>
-                    );
+                    return <AttackCard key={a.id} a={a} atkNat={atkNat} defNat={defNat} hrs={hrs} mins={mins} isDefender={a.defenderIdx===myNatIdx} onDefend={addDefense}/>;
                   })}
                 </div>
               )}
             </div>
           )}
 
-          {/* ランキング */}
           {screen==="rank"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:12,letterSpacing:2}}>// 世界支配率ランキング</div>
@@ -914,7 +905,7 @@ export default function App(){
                   .sort((a,b)=>b.t-a.t).map(({n,i,t},rank)=>{
                   const pct=(t/Math.max(1,LAND_IDX.length)*100).toFixed(2);
                   const pois=POI.filter(p=>poiOwner[p.id]===i);
-                  const dailyIncome=pois.reduce((s,p)=>s+p.income,0);
+                  const dailyIncome=pois.reduce((s,p)=>s+p.income,0)+Math.floor(t/100)*INCOME_PER_100TILES_PER_HOUR*24;
                   return(
                     <div key={n.id} className="panel" style={{border:`1px solid ${rank===0?n.color+"88":"#1a3a1a"}`}}>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
@@ -948,7 +939,6 @@ export default function App(){
             </div>
           )}
 
-          {/* ニュース */}
           {screen==="news"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:12,letterSpacing:2}}>// WORLD NEWS</div>
@@ -958,18 +948,17 @@ export default function App(){
             </div>
           )}
 
-          {/* ヘルプ */}
           {screen==="help"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:16,letterSpacing:2}}>// HOW TO PLAY</div>
               {[
                 {t:"🎯 目的",b:"勉強時間を資金に変えて世界地図を支配せよ。世界支配率1位の国家が覇者！"},
                 {t:"📚 勉強→資金",b:"[ 記録 ]で申告。\n1時間=1,000💰=1マス拡張"},
-                {t:"⚔️ 戦闘",b:"MAPで[ ⚔️侵攻 ]をON→赤いマスをクリック。\n資金を入力して「侵攻宣言」→24時間後に自動解決。\n防衛側は24時間以内に「防衛強化」で上乗せ可能。\n金額は非公開、多い方が勝利！"},
-                {t:"🛡 防衛予算",b:"[ 記録 ]タブで防衛予算を設定。\n侵攻を受けたとき自動で使われる。\nログインできない日も守られる！"},
+                {t:"💰 領土収益",b:"ログインするたびに前回からの経過時間分の収益が自動で入る。\n毎日ログインするほど有利！\n🏙大都市〜2,000💰/日\n⚓海峡〜1,800💰/日\n⛏資源〜1,500💰/日"},
+                {t:"⚔️ 戦闘",b:"MAPで[ ⚔️侵攻 ]をON→赤いマスをクリック。\n資金を入力して侵攻宣言→24時間後に自動解決。\n防衛側は[ 軍事 ]タブで防衛強化できる。"},
+                {t:"🛡 防衛予算",b:"[ 記録 ]タブで設定。\n侵攻を受けたとき自動で使われる。\nログインできない日も守られる！"},
                 {t:"🗡⚓✈️ 軍種",b:"陸軍：隣接マスのみ\n海軍：20,000💰、海越え半径15マス\n空軍：50,000💰、射程5マスの遠距離"},
-                {t:"🏙⚓⛏ 重要地点",b:"🏙大都市〜2,000💰/日\n⚓海峡〜1,800💰/日\n⛏資源〜1,500💰/日"},
-                {t:"🗺️ 操作",b:"スクロール:ズーム / ドラッグ:移動\n[ 自国 ][ 全体 ][ 🔄 ]"},
+                {t:"🗺️ 操作",b:"スクロール:ズーム / ドラッグ:移動\n[ 自国 ][ 全体 ]"},
               ].map(({t,b})=>(
                 <div key={t} className="panel" style={{marginBottom:10}}>
                   <div style={{fontSize:13,fontWeight:900,marginBottom:6}}>{t}</div>
@@ -980,7 +969,6 @@ export default function App(){
           )}
         </div>
 
-        {/* サイドニュース */}
         {screen!=="placing"&&(
           <div style={{borderLeft:"1px solid #1a3a1a",background:"#030d03",display:"flex",flexDirection:"column",overflow:"hidden"}}>
             <div style={{padding:"7px 12px",borderBottom:"1px solid #332200",fontSize:10,color:"#887700",letterSpacing:2}}>// LIVE NEWS</div>
@@ -996,7 +984,6 @@ export default function App(){
                 <div style={{color:myTitle?.color,fontSize:10,marginBottom:2}}>{myTitle?.label}</div>
                 <div style={{color:"#2a5a2a",fontSize:10}}>💰{myNat.fund.toLocaleString()}</div>
                 <div style={{color:"#2a5a2a",fontSize:10}}>{myTerritory}マス | {myPOIs.length}拠点</div>
-                <div style={{color:"#2a5a2a",fontSize:10}}>🛡{(myNat.defenseBudget||0).toLocaleString()}💰</div>
                 {myNat.navy&&<div style={{fontSize:10,color:"#00B4FF"}}>⚓海軍保有</div>}
                 {myNat.air&&<div style={{fontSize:10,color:"#FFD700"}}>✈️空軍保有</div>}
               </div>
