@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 
-const FB = "https://studytoon-dad1f-default-rtdb.firebaseio.com/st3";
+const FB_BASE = "https://studytoon-dad1f-default-rtdb.firebaseio.com";
 const MW = 180, MH = 90, CELL = 7;
 const FUND_PER_MIN = 1000 / 60;
 const MINS_PER_CELL = 60;
@@ -8,11 +8,14 @@ const ATTACK_RESOLVE_MS = 24 * 60 * 60 * 1000;
 const INCOME_PER_100TILES_PER_HOUR = 100; // 100マスで100💰/時間
 const SYNC_INTERVAL = 5000; // 5秒ごとにsync
 
-async function fbGet(path) {
-  try { const r = await fetch(`${FB}/${path}.json`); return await r.json(); } catch { return null; }
+function roomPath(roomCode, sub) {
+  return `rooms/${roomCode}${sub ? "/" + sub : ""}`;
 }
-async function fbSet(path, data) {
-  try { await fetch(`${FB}/${path}.json`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data) }); return true; } catch { return false; }
+async function fbGet(roomCode, sub) {
+  try { const r = await fetch(`${FB_BASE}/${roomPath(roomCode, sub)}.json`); return await r.json(); } catch { return null; }
+}
+async function fbSet(roomCode, sub, data) {
+  try { await fetch(`${FB_BASE}/${roomPath(roomCode, sub)}.json`, { method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(data) }); return true; } catch { return false; }
 }
 
 const RAW_MAP = (() => {
@@ -110,6 +113,12 @@ const TITLES=[
   {min:1000000,label:"Eternal",   color:"#FF2D55"},
 ];
 function getTitle(f){let t=TITLES[0];for(const tt of TITLES)if(f>=tt.min)t=tt;return t;}
+const ONBOARD_SLIDES=[
+  {t:"目的",b:"勉強した時間を糧にして、世界地図を征服しよう。"},
+  {t:"領土拡大",b:"計測した勉強時間に応じて、領土がどんどん広がっていく。"},
+  {t:"侵攻",b:"欲しい土地があれば、他の国に攻め込むこともできる（任意）。"},
+  {t:"戦闘のルール",b:"勝敗を決めるのは、その戦いに賭けた軍資金の多さ。\n攻める側は、その都度投入する金額を決める。\n守る側は、普段から設定できる防衛費に加えて、攻められるたびに追加の資金を投入できる。"},
+];
 const UNLOCK={navy:20000,air:50000};
 const AIR_RANGE=5;
 
@@ -160,18 +169,30 @@ function calcIncome(nations, owned, lastLoginTime) {
 function resolveAttack(a, nats, ow) {
   const atkNat = nats[a.attackerIdx];
   const defNat = a.defenderIdx >= 0 ? nats[a.defenderIdx] : null;
-  const defFund = a.defenseFund || (defNat ? Math.floor(defNat.defenseBudget || 0) : 0);
-  const win = a.attackFund > defFund;
+  // 防衛力 = 「恒常設定(defenseBudget)」+「この戦闘限定の追加防衛(a.defenseFund)」を、
+  // その時点で実際に国が持っている資金(fund)の範囲内で、都度組み立てる。
+  // 恒常設定はロック(確保)されているわけではなく、あくまで毎回「宣言」でしかない。
+  const intendedDefense = (defNat ? Math.floor(defNat.defenseBudget || 0) : 0) + Math.floor(a.defenseFund || 0);
+  const availableFund = defNat ? defNat.fund : 0;
+  const defSpent = defNat ? Math.min(intendedDefense, availableFund) : 0; // 実際に投入できた防衛力（資金が足りなければそれが上限）
+  const win = a.attackFund > defSpent;
   const newNats = [...nats];
   const newOwned = new Int8Array(ow);
   if (win) {
     newOwned[a.cellIdx] = a.attackerIdx;
-    const loot = Math.floor(defFund * 0.3);
-    newNats[a.attackerIdx] = { ...newNats[a.attackerIdx], fund: Math.max(0, newNats[a.attackerIdx].fund + loot) };
-    if (a.defenderIdx >= 0) newNats[a.defenderIdx] = { ...newNats[a.defenderIdx], fund: Math.max(0, newNats[a.defenderIdx].fund - loot) };
+    // 防衛側は「投入した防衛力(defSpent)」をそのまま失い、さらに戦利品として追加でその30%を奪われる。
+    // 合計損失が保有資金を超えないようクランプする。
+    const extraLoot = Math.floor(defSpent * 0.3);
+    const totalLoss = defNat ? Math.min(defSpent + extraLoot, defNat.fund) : 0;
+    newNats[a.attackerIdx] = { ...newNats[a.attackerIdx], fund: Math.max(0, newNats[a.attackerIdx].fund + extraLoot) };
+    if (a.defenderIdx >= 0) newNats[a.defenderIdx] = { ...newNats[a.defenderIdx], fund: Math.max(0, newNats[a.defenderIdx].fund - totalLoss) };
     const poi = POI.find(p => p.x === a.cellIdx % MW && p.y === Math.floor(a.cellIdx / MW));
     return { nations: newNats, owned: newOwned, news: `【制圧】${atkNat?.name}が${defNat ? defNat.name + "の領土" : "未開地"}を制圧！${poi ? ` — ${poi.name}獲得` : ""}` };
   } else {
+    // 防衛成功時も、実際に投入した防衛力(defSpent)は「使った」ものとして消費される（略奪はされない）。
+    if (a.defenderIdx >= 0 && defSpent > 0) {
+      newNats[a.defenderIdx] = { ...newNats[a.defenderIdx], fund: Math.max(0, newNats[a.defenderIdx].fund - defSpent) };
+    }
     return { nations: newNats, owned: newOwned, news: `【防衛成功】${defNat?.name || "未開地"}、${atkNat?.name}の侵攻を撃退！` };
   }
 }
@@ -242,19 +263,27 @@ export default function App(){
   const [defBudget,setDefBudget]=useState("");
   const [syncing,setSyncing]=useState(false);
   const [incomeAlert,setIncomeAlert]=useState(null); // ログイン時収益通知
+  const [onboardStep,setOnboardStep]=useState(0);
+  const [newPin,setNewPin]=useState("");
+  const [resumeTarget,setResumeTarget]=useState(null);
+  const [resumePinInput,setResumePinInput]=useState("");
+  const [pinError,setPinError]=useState("");
+  const [roomCode,setRoomCode]=useState(null);
+  const [roomInput,setRoomInput]=useState("");
   const drag=useRef({on:false,sx:0,sy:0,cx:0,cy:0,moved:false});
   const lastSyncRef=useRef(0);
 
-  useEffect(()=>{loadAll(true);},[]);
+  useEffect(()=>{if(roomCode)loadAll(true);},[roomCode]);
   useEffect(()=>{
+    if(!roomCode)return;
     const iv=setInterval(()=>loadAll(false),SYNC_INTERVAL);
     return()=>clearInterval(iv);
-  },[]);
+  },[roomCode]);
 
   async function loadAll(isFirstLoad){
     if(!isFirstLoad && Date.now()-lastSyncRef.current < SYNC_INTERVAL-500) return;
     lastSyncRef.current=Date.now();
-    const data=await fbGet("");
+    const data=await fbGet(roomCode,"");
     if(!data){setLoaded(true);return;}
     let nats=data.nations||[];
     let ow=new Int8Array(data.owned||new Array(MW*MH).fill(-1));
@@ -272,7 +301,7 @@ export default function App(){
         nl=[result.news,...nl.slice(0,49)];
       }
       atks=atks.map(a=>toResolve.find(r=>r.id===a.id)?{...a,resolved:true}:a);
-      await fbSet("",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
+      await fbSet(roomCode,"",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
     }
 
     // ログイン時収益（初回ロードのみ）
@@ -284,9 +313,9 @@ export default function App(){
         nl=[...incomeNews,...nl.slice(0,49)];
         setIncomeAlert(incomeLog);
         setTimeout(()=>setIncomeAlert(null),8000);
-        await fbSet("",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
+        await fbSet(roomCode,"",{nations:nats,owned:Array.from(ow),news:nl,players:pl,attacks:atks,lastUpdate:now});
       } else {
-        await fbSet("lastUpdate",now);
+        await fbSet(roomCode,"lastUpdate",now);
       }
     }
 
@@ -296,7 +325,7 @@ export default function App(){
 
   async function saveAll(nats,ow,nl,pl,atks){
     setSyncing(true);
-    await fbSet("",{nations:nats,owned:Array.from(ow),news:nl.slice(0,50),players:pl,attacks:atks||[],lastUpdate:Date.now()});
+    await fbSet(roomCode,"",{nations:nats,owned:Array.from(ow),news:nl.slice(0,50),players:pl,attacks:atks||[],lastUpdate:Date.now()});
     setSyncing(false);
   }
 
@@ -331,7 +360,7 @@ export default function App(){
     addNewsAndSave(`【建国】${nat.name}、${near?near.name+"付近":"未知の地"}に建国`,newNats,newO,newsLog,newPlayers);
     setMyPlayer(pendingP);
     setPendingNat(null);setPendingP(null);setHoverCell(null);
-    setCam({x:sx,y:sy});setZoom(4);setScreen("map");
+    setCam({x:sx,y:sy});setZoom(4);setOnboardStep(0);setScreen("onboarding");
   }
 
   function handleJoin(){
@@ -341,7 +370,7 @@ export default function App(){
       const ex=nations.find(n=>n.name===newNName.trim());
       if(ex){doJoin(ex);return;}
       const nat={id:`n_${Date.now()}`,name:newNName.trim(),color:newNColor,dark:mkDark(newNColor),sx:0,sy:0,fund:0,totalFund:0,navy:false,air:false,defenseBudget:0};
-      const p={name:joinName.trim(),nationId:nat.id,totalFund:0};
+      const p={name:joinName.trim(),nationId:nat.id,totalFund:0,pin:newPin.trim()||null};
       setPendingNat(nat);setPendingP(p);
       setCam({x:MW/2,y:MH/2});setZoom(1.5);setScreen("placing");
     } else if(joinTab==="existing"){
@@ -355,15 +384,28 @@ export default function App(){
     setMyPlayer(p);
     const nat=nations.find(n=>n.id===p.nationId);
     if(nat){setCam({x:nat.sx,y:nat.sy});setZoom(4);}
+    setResumeTarget(null);setResumePinInput("");setPinError("");
     setScreen("map");
   }
 
+  function requestResume(p){
+    // 暗証番号未設定（旧データ等）の場合は、そのまま入れる
+    if(!p.pin){resumePlayer(p);return;}
+    setResumeTarget(p);setResumePinInput("");setPinError("");
+  }
+
+  function confirmResume(){
+    if(!resumeTarget)return;
+    if(resumePinInput===resumeTarget.pin){resumePlayer(resumeTarget);}
+    else{setPinError("暗証番号が違います");}
+  }
+
   function doJoin(nat){
-    const p={name:joinName.trim(),nationId:nat.id,totalFund:0};
+    const p={name:joinName.trim(),nationId:nat.id,totalFund:0,pin:newPin.trim()||null};
     const newPlayers=[...allPlayers.filter(x=>x.name!==p.name),p];
     setAllPlayers(newPlayers);setMyPlayer(p);
     addNewsAndSave(`【参戦】${p.name} → ${nat.name}`,nations,owned,newsLog,newPlayers);
-    setCam({x:nat.sx,y:nat.sy});setZoom(4);setScreen("map");
+    setCam({x:nat.sx,y:nat.sy});setZoom(4);setOnboardStep(0);setScreen("onboarding");
   }
 
   async function submitStudy(){
@@ -635,14 +677,52 @@ export default function App(){
     .btn.red{border-color:#FF2D5555;color:#FF2D55}.btn.red:hover{background:#FF2D5522}
     .btn.gold{border-color:#FFD70055;color:#FFD700}.btn.gold:hover{background:#FFD70022}
     .panel{background:#050f05;border:1px solid #1a3a1a;border-radius:6px;padding:14px}
-    input[type=text],input[type=number]{background:#050f05;border:1px solid #1a3a1a;color:#00FF9C;border-radius:3px;padding:8px 10px;font-family:monospace;font-size:13px;outline:none;width:100%}
+    input[type=text],input[type=number],input[type=password]{background:#050f05;border:1px solid #1a3a1a;color:#00FF9C;border-radius:3px;padding:8px 10px;font-family:monospace;font-size:13px;outline:none;width:100%}
     input:focus{border-color:#00FF9C}
     ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#050f05}::-webkit-scrollbar-thumb{background:#1a3a1a}
   `;
 
+  function genRoomCode(){
+    const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let c="";
+    for(let i=0;i<6;i++)c+=chars[Math.floor(Math.random()*chars.length)];
+    return c;
+  }
+
+  if(!roomCode)return(
+    <div style={{minHeight:"100vh",background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <style>{css}</style>
+      <div style={{width:"100%",maxWidth:440}}>
+        <div style={{textAlign:"center",marginBottom:20}}>
+          <div style={{fontSize:26,fontWeight:900,letterSpacing:6,marginBottom:4}}>STUDYTOON</div>
+          <div style={{fontSize:9,color:"#2a5a2a",letterSpacing:3}}>どの戦場（部屋）で戦うか選べ</div>
+        </div>
+        <div className="panel" style={{marginBottom:14}}>
+          <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10,letterSpacing:2}}>// 友人・学校の部屋に参加する</div>
+          <div style={{display:"flex",gap:8}}>
+            <input type="text" placeholder="部屋コードを入力（例：AB3XQ9）" value={roomInput}
+              onChange={e=>setRoomInput(e.target.value.toUpperCase())}
+              onKeyDown={e=>{if(e.key==="Enter"&&roomInput.trim())setRoomCode(roomInput.trim());}}/>
+            <button className="btn" style={{padding:"8px 16px",fontSize:12}}
+              disabled={!roomInput.trim()} onClick={()=>setRoomCode(roomInput.trim())}>▶ 参加</button>
+          </div>
+          <div style={{fontSize:10,color:"#2a5a2a",marginTop:8,lineHeight:1.7}}>友達・学校のグループから共有されたコードを入力してください。</div>
+        </div>
+        <div style={{textAlign:"center",fontSize:10,color:"#2a5a2a",margin:"10px 0",letterSpacing:2}}>─── または ───</div>
+        <div className="panel">
+          <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10,letterSpacing:2}}>// 新しい戦場を開く</div>
+          <button className="btn gold" style={{width:"100%",fontSize:13,padding:"12px"}}
+            onClick={()=>setRoomCode(genRoomCode())}>🏰 新規の部屋を作る</button>
+          <div style={{fontSize:10,color:"#2a5a2a",marginTop:8,lineHeight:1.7}}>部屋を作ると、専用のコードが発行されます。友達・志望校仲間にそのコードを共有すれば、同じ地図で戦えます。</div>
+        </div>
+      </div>
+    </div>
+  );
+
   if(!loaded)return(
     <div style={{height:"100vh",background:"#020902",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"monospace",color:"#00FF9C",flexDirection:"column",gap:12}}>
       <div style={{fontSize:28,fontWeight:900,letterSpacing:6}}>STUDYTOON</div>
+      <div style={{fontSize:9,color:"#FFD700",letterSpacing:2,marginBottom:4}}>部屋: {roomCode}</div>
       <div style={{fontSize:11,color:"#2a5a2a",animation:"pulse 1s infinite"}}>Firebaseに接続中...</div>
       <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}`}</style>
     </div>
@@ -668,15 +748,28 @@ export default function App(){
               ?<div style={{color:"#2a5a2a",fontSize:11,textAlign:"center",padding:"16px 0"}}>まだ参加履歴がありません</div>
               :allPlayers.map(p=>{
                 const n=nations.find(x=>x.id===p.nationId);
+                const isTarget=resumeTarget?.name===p.name;
                 return(
-                  <button key={p.name} onClick={()=>resumePlayer(p)} style={{background:"#030d03",border:`2px solid ${n?.color||"#1a3a1a"}44`,borderRadius:6,padding:"12px 14px",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,width:"100%",marginBottom:8}}>
-                    {n&&<div style={{width:10,height:10,background:n.color,borderRadius:2,flexShrink:0}}/>}
-                    <div>
-                      <div style={{fontSize:13,fontWeight:900,color:n?.color||"#00FF9C"}}>{p.name}</div>
-                      <div style={{fontSize:10,color:"#2a5a2a",marginTop:2}}>{n?.name||"不明"} | {getTitle(p.totalFund||0).label}</div>
-                    </div>
-                    <div style={{marginLeft:"auto",fontSize:10,color:"#2a5a2a"}}>▶ 再開</div>
-                  </button>
+                  <div key={p.name}>
+                    <button onClick={()=>requestResume(p)} style={{background:"#030d03",border:`2px solid ${isTarget?(n?.color||"#00FF9C"):(n?.color||"#1a3a1a")+"44"}`,borderRadius:6,padding:"12px 14px",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10,width:"100%",marginBottom:isTarget?6:8}}>
+                      {n&&<div style={{width:10,height:10,background:n.color,borderRadius:2,flexShrink:0}}/>}
+                      <div>
+                        <div style={{fontSize:13,fontWeight:900,color:n?.color||"#00FF9C"}}>{p.name}</div>
+                        <div style={{fontSize:10,color:"#2a5a2a",marginTop:2}}>{n?.name||"不明"} | {getTitle(p.totalFund||0).label}{p.pin?" | 🔒":""}</div>
+                      </div>
+                      <div style={{marginLeft:"auto",fontSize:10,color:"#2a5a2a"}}>{p.pin?"▶ 暗証番号入力":"▶ 再開"}</div>
+                    </button>
+                    {isTarget&&(
+                      <div style={{display:"flex",gap:6,marginBottom:8,paddingLeft:2}}>
+                        <input type="password" placeholder="暗証番号" value={resumePinInput}
+                          onChange={e=>{setResumePinInput(e.target.value);setPinError("");}}
+                          onKeyDown={e=>{if(e.key==="Enter")confirmResume();}}
+                          style={{flex:1}} autoFocus/>
+                        <button className="btn" style={{padding:"8px 14px",fontSize:12}} onClick={confirmResume}>▶</button>
+                      </div>
+                    )}
+                    {isTarget&&pinError&&<div style={{fontSize:10,color:"#FF2D55",marginBottom:8,paddingLeft:2}}>{pinError}</div>}
+                  </div>
                 );
               })
             }
@@ -686,7 +779,9 @@ export default function App(){
           <div>
             <div className="panel" style={{marginBottom:10}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 指揮官名</div>
-              <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)}/>
+              <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)} style={{marginBottom:12}}/>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 暗証番号（他人のなりすまし防止・任意）</div>
+              <input type="password" placeholder="4桁程度の数字など" value={newPin} onChange={e=>setNewPin(e.target.value)}/>
             </div>
             <div className="panel" style={{marginBottom:14}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 国家選択（場所・戦力は参加後に公開）</div>
@@ -712,7 +807,9 @@ export default function App(){
           <div>
             <div className="panel" style={{marginBottom:10}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 指揮官名</div>
-              <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)}/>
+              <input type="text" placeholder="名前を入力..." value={joinName} onChange={e=>setJoinName(e.target.value)} style={{marginBottom:12}}/>
+              <div style={{fontSize:10,color:"#2a5a2a",marginBottom:8}}>// 暗証番号（他人のなりすまし防止・任意）</div>
+              <input type="password" placeholder="4桁程度の数字など" value={newPin} onChange={e=>setNewPin(e.target.value)}/>
             </div>
             <div className="panel" style={{marginBottom:14}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10}}>// 国家設立</div>
@@ -726,6 +823,37 @@ export default function App(){
               disabled={!joinName.trim()||!newNName.trim()}>🏰 建国して拠点を選ぶ</button>
           </div>
         )}
+      </div>
+    </div>
+  );
+
+  if(screen==="onboarding")return(
+    <div style={{minHeight:"100vh",background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <style>{css}</style>
+      <div style={{width:"100%",maxWidth:460}}>
+        <div style={{textAlign:"center",marginBottom:18}}>
+          <div style={{fontSize:9,color:"#FFD700",letterSpacing:3,marginBottom:6}}>// {onboardStep+1} / {ONBOARD_SLIDES.length}</div>
+          <div style={{display:"flex",gap:4,justifyContent:"center"}}>
+            {ONBOARD_SLIDES.map((_,i)=>(
+              <div key={i} style={{width:i===onboardStep?18:6,height:4,borderRadius:2,background:i===onboardStep?"#FFD700":"#1a3a1a",transition:"all 0.2s"}}/>
+            ))}
+          </div>
+        </div>
+        <div className="panel" style={{border:"1px solid #FFD70044",marginBottom:16,minHeight:140,display:"flex",flexDirection:"column",justifyContent:"center"}}>
+          <div style={{fontSize:16,fontWeight:900,color:"#FFD700",letterSpacing:2,marginBottom:12,textAlign:"center"}}>
+            {ONBOARD_SLIDES[onboardStep].t}
+          </div>
+          <div style={{fontSize:13,color:"#00FF9C",lineHeight:2,whiteSpace:"pre-line",textAlign:"center"}}>
+            {ONBOARD_SLIDES[onboardStep].b}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button className="nb" style={{flex:1}} onClick={()=>setScreen("record")}>スキップ</button>
+          {onboardStep<ONBOARD_SLIDES.length-1
+            ?<button className="btn gold" style={{flex:2,fontSize:13,padding:"11px"}} onClick={()=>setOnboardStep(s=>s+1)}>次へ ▶</button>
+            :<button className="btn gold" style={{flex:2,fontSize:13,padding:"11px"}} onClick={()=>setScreen("record")}>はじめる ▶</button>
+          }
+        </div>
       </div>
     </div>
   );
@@ -746,7 +874,10 @@ export default function App(){
       )}
 
       <div style={{background:"#030d03",borderBottom:"1px solid #1a3a1a",padding:"6px 14px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
-        <span style={{fontSize:13,fontWeight:900,letterSpacing:4}}>STUDYTOON</span>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:13,fontWeight:900,letterSpacing:4}}>STUDYTOON</span>
+          <span style={{fontSize:9,color:"#FFD700",border:"1px solid #FFD70044",borderRadius:3,padding:"2px 6px",letterSpacing:1}}>部屋:{roomCode}</span>
+        </div>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           {pendingAtks.length>0&&<span style={{fontSize:10,color:"#FF2D55",animation:"pulse 1s infinite"}}>⚠️ 侵攻を受けています！</span>}
           {myTitle&&<span style={{fontSize:10,color:myTitle.color,fontWeight:900}}>{myTitle.label}</span>}
@@ -771,7 +902,8 @@ export default function App(){
             <button className="nb" onClick={()=>{setCam({x:myNat?.sx||MW/2,y:myNat?.sy||MH/2});setZoom(4);}}>[ 自国 ]</button>
             <button className="nb" onClick={()=>{setCam({x:MW/2,y:MH/2});setZoom(1.5);}}>[ 全体 ]</button>
           </>}
-          <button className="nb" style={{marginLeft:"auto"}} onClick={()=>setScreen("join")}>退出</button>
+          <button className="nb" style={{marginLeft:"auto"}} onClick={()=>setScreen("join")}>指揮官切替</button>
+          <button className="nb" style={{borderColor:"#FFD70044",color:"#887700"}} onClick={()=>{setRoomCode(null);setLoaded(false);setScreen("join");setMyPlayer(null);}}>部屋を変える</button>
         </div>
       )}
 
