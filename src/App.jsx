@@ -991,13 +991,16 @@ export default function App(){
             </div>
           )}
 
-          {screen==="military"&&(
+          {screen==="military"&&(()=>{
+            const touchesSea=myNatIdx>=0?(()=>{for(let i=0;i<MW*MH;i++){if(owned[i]!==myNatIdx)continue;if(nbrs(i).some(nb=>!RAW_MAP[nb]))return true;}return false;})():false;
+            return(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:14,letterSpacing:2}}>// 軍事システム</div>
               {[
-                {type:"army",label:"🗡 陸軍",desc:"隣接マスへの侵攻のみ",unlocked:true,cost:0},
-                {type:"navy",label:"⚓ 海軍",desc:"海を渡り半径15マス内を攻撃可能",unlocked:myNat?.navy||false,cost:UNLOCK.navy},
-                {type:"air", label:"✈️ 空軍",desc:`自国マスから半径${AIR_RANGE}マス内を攻撃可能`,unlocked:myNat?.air||false,cost:UNLOCK.air},
+                {type:"army",label:"🗡 陸軍",desc:"隣接マスへの侵攻のみ",unlocked:true,cost:0,note:null},
+                {type:"navy",label:"⚓ 海軍",desc:"海に面した領土から、半径15マス内を攻撃可能",unlocked:myNat?.navy||false,cost:UNLOCK.navy,
+                  note: myNat?.navy ? (touchesSea?{ok:true,text:"現在、海に接する領土あり。効果が発動しています"}:{ok:false,text:"⚠️ 現在、海に接する領土がありません。海に届くまで、まだ効果を発揮できません"}) : {ok:null,text:"※ 効果を発揮するには、自国の領土が海（地図の陸地の外側）に接している必要があります"}},
+                {type:"air", label:"✈️ 空軍",desc:`自国のどの領土からでも、半径${AIR_RANGE}マス内を攻撃可能`,unlocked:myNat?.air||false,cost:UNLOCK.air,note:null},
               ].map(m=>(
                 <div key={m.type} className="panel" style={{marginBottom:12,border:`1px solid ${m.unlocked?"#00FF9C44":"#1a3a1a"}`}}>
                   <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
@@ -1005,8 +1008,11 @@ export default function App(){
                     <span style={{fontSize:10,color:m.unlocked?"#00FF9C":"#2a5a2a"}}>{m.unlocked?"✓ 解放済み":`${m.cost.toLocaleString()}💰`}</span>
                   </div>
                   <div style={{fontSize:11,color:"#5a8a5a",marginBottom:m.unlocked?0:10}}>{m.desc}</div>
+                  {m.note&&(
+                    <div style={{fontSize:10,color:m.note.ok===false?"#FF2D55":m.note.ok===true?"#00FF9C":"#2a5a2a",marginTop:6,lineHeight:1.6}}>{m.note.text}</div>
+                  )}
                   {!m.unlocked&&myNat&&(
-                    <button className="btn gold" style={{width:"100%",fontSize:12,padding:"8px"}}
+                    <button className="btn gold" style={{width:"100%",fontSize:12,padding:"8px",marginTop:m.note?8:0}}
                       onClick={()=>unlockMilitary(m.type)} disabled={myNat.fund<m.cost}>
                       {myNat.fund>=m.cost?"解放する":"資金不足"} ({myNat.fund.toLocaleString()}/{m.cost.toLocaleString()}💰)
                     </button>
@@ -1027,7 +1033,8 @@ export default function App(){
                 </div>
               )}
             </div>
-          )}
+            );
+          })()}
 
           {screen==="rank"&&(
             <div style={{padding:20,overflowY:"auto",height:"100%"}}>
@@ -1062,12 +1069,33 @@ export default function App(){
                 })}
               </div>
               <div style={{fontSize:10,color:"#2a5a2a",marginBottom:10,letterSpacing:2}}>// 称号</div>
-              {TITLES.map(t=>(
-                <div key={t.label} style={{display:"flex",justifyContent:"space-between",background:"#050f05",border:"1px solid #1a3a1a",borderRadius:4,padding:"6px 12px",marginBottom:4}}>
-                  <span style={{fontSize:12,fontWeight:900,color:t.color}}>{t.label}</span>
-                  <span style={{fontSize:10,color:"#2a5a2a"}}>{t.min.toLocaleString()}💰〜</span>
-                </div>
-              ))}
+              {myPlayer&&(()=>{
+                const cur=(myPlayer.totalFund||0);
+                const idx=TITLES.findIndex(t=>t.label===(myTitle?.label));
+                const next=TITLES[idx+1];
+                return next?(
+                  <div className="panel" style={{marginBottom:10,border:`1px solid ${myTitle.color}66`}}>
+                    <div style={{fontSize:10,color:"#2a5a2a",marginBottom:6}}>次の称号「{next.label}」まで</div>
+                    <div style={{fontSize:13,fontWeight:900,color:next.color,marginBottom:6}}>あと {(next.min-cur).toLocaleString()}💰</div>
+                    <div style={{background:"#030d03",height:5,borderRadius:2,overflow:"hidden"}}>
+                      <div style={{width:`${Math.min(100,((cur-TITLES[idx].min)/(next.min-TITLES[idx].min))*100)}%`,height:"100%",background:next.color,transition:"width 0.8s"}}/>
+                    </div>
+                  </div>
+                ):(
+                  <div className="panel" style={{marginBottom:10,border:`1px solid ${myTitle?.color}66`}}>
+                    <div style={{fontSize:12,color:myTitle?.color,fontWeight:900}}>最高位「{myTitle?.label}」に到達済み</div>
+                  </div>
+                );
+              })()}
+              {TITLES.map(t=>{
+                const isCur=myTitle?.label===t.label;
+                return(
+                  <div key={t.label} style={{display:"flex",justifyContent:"space-between",background:isCur?t.color+"22":"#050f05",border:`1px solid ${isCur?t.color:"#1a3a1a"}`,borderRadius:4,padding:"6px 12px",marginBottom:4}}>
+                    <span style={{fontSize:12,fontWeight:900,color:t.color}}>{isCur&&"▶ "}{t.label}</span>
+                    <span style={{fontSize:10,color:"#2a5a2a"}}>{t.min.toLocaleString()}💰〜</span>
+                  </div>
+                );
+              })}
             </div>
           )}
 
