@@ -663,6 +663,46 @@ export default function App(){
     }
   };
 
+  // --- スマホのタッチ操作対応（1本指:ドラッグ/タップ、2本指:ピンチズーム） ---
+  const pinchRef = useRef({ dist: null });
+  const onTouchStart = e => {
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      onMD({ clientX: t.clientX, clientY: t.clientY });
+    } else if (e.touches.length === 2) {
+      const [a, b] = e.touches;
+      pinchRef.current.dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      drag.current.on = false;
+    }
+  };
+  const onTouchMove = e => {
+    e.preventDefault();
+    if (e.touches.length === 1 && drag.current.on) {
+      const t = e.touches[0];
+      onMM({ clientX: t.clientX, clientY: t.clientY });
+    } else if (e.touches.length === 2) {
+      const [a, b] = e.touches;
+      const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      const prev = pinchRef.current.dist;
+      if (prev) {
+        const delta = dist - prev;
+        setZoom(z => Math.max(0.5, Math.min(8, z + delta * 0.01)));
+      }
+      pinchRef.current.dist = dist;
+    }
+  };
+  const onTouchEnd = e => {
+    if (e.touches.length === 0) {
+      const t = e.changedTouches[0];
+      if (t) onMU({ clientX: t.clientX, clientY: t.clientY });
+      pinchRef.current.dist = null;
+    } else if (e.touches.length === 1) {
+      pinchRef.current.dist = null;
+      const t = e.touches[0];
+      drag.current = { on: true, sx: t.clientX, sy: t.clientY, cx: cam.x, cy: cam.y, moved: true };
+    }
+  };
+
   const css=`
     *{box-sizing:border-box}body{margin:0}
     .app-shell{height:100vh}
@@ -952,9 +992,10 @@ export default function App(){
             <canvas ref={cvs}
               width={canvasSize.w}
               height={canvasSize.h}
-              style={{display:"block",width:canvasSize.w+"px",height:canvasSize.h+"px",cursor:screen==="placing"?"crosshair":atkMode?"crosshair":"grab"}}
+              style={{display:"block",width:canvasSize.w+"px",height:canvasSize.h+"px",touchAction:"none",cursor:screen==="placing"?"crosshair":atkMode?"crosshair":"grab"}}
               onWheel={onWheel} onMouseDown={onMD} onMouseMove={onMM}
               onMouseUp={onMU} onMouseLeave={()=>{drag.current.on=false;setHoverCell(null);setHovPoi(null);}}
+              onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
             />
           )}
 
