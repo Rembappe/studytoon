@@ -665,6 +665,8 @@ export default function App(){
 
   const css=`
     *{box-sizing:border-box}body{margin:0}
+    .app-shell{height:100vh}
+    @supports (height: 100dvh){ .app-shell{height:100dvh} }
     @keyframes slide{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
     @keyframes ticker{0%{transform:translateX(100%)}100%{transform:translateX(-200%)}}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
@@ -681,6 +683,33 @@ export default function App(){
     input:focus{border-color:#00FF9C}
     ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#050f05}::-webkit-scrollbar-thumb{background:#1a3a1a}
   `;
+
+  const canvasWrapRef = useRef(null);
+  const [canvasSize, setCanvasSize] = useState({ w: 800, h: 600 });
+
+  useEffect(() => {
+    function measure() {
+      const el = canvasWrapRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const w = Math.max(1, Math.floor(rect.width));
+      const h = Math.max(1, Math.floor(rect.height));
+      setCanvasSize(prev => (prev.w === w && prev.h === h ? prev : { w, h }));
+    }
+    measure();
+    // モバイルSafari等ではURLバーの表示/非表示でビューポートが変化するため、
+    // resize/orientationchangeに加えて、少し遅延させた再計測も行う（レイアウト確定待ち）
+    window.addEventListener('resize', measure);
+    window.addEventListener('orientationchange', measure);
+    const t1 = setTimeout(measure, 100);
+    const t2 = setTimeout(measure, 400);
+    return () => {
+      window.removeEventListener('resize', measure);
+      window.removeEventListener('orientationchange', measure);
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [screen, atkMode, atkTarget]);
 
   function genRoomCode(){
     const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -859,7 +888,7 @@ export default function App(){
   );
 
   return(
-    <div style={{height:"100vh",background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+    <div className="app-shell" style={{background:"#020902",fontFamily:"monospace",color:"#00FF9C",display:"flex",flexDirection:"column",overflow:"hidden"}}>
       <style>{css}</style>
       <div style={{position:"fixed",inset:0,background:"repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,156,0.01) 2px,rgba(0,255,156,0.01) 4px)",pointerEvents:"none",zIndex:999}}/>
 
@@ -918,12 +947,12 @@ export default function App(){
       )}
 
       <div style={{flex:1,display:"grid",gridTemplateColumns:screen==="placing"?"1fr":"1fr 220px",overflow:"hidden"}}>
-        <div style={{overflow:"hidden",position:"relative"}}>
+        <div ref={canvasWrapRef} style={{overflow:"hidden",position:"relative",width:"100%",height:"100%"}}>
           {(screen==="map"||screen==="placing")&&(
             <canvas ref={cvs}
-              width={screen==="placing"?window.innerWidth:window.innerWidth-220}
-              height={window.innerHeight-(atkMode&&atkTarget?130:90)}
-              style={{display:"block",cursor:screen==="placing"?"crosshair":atkMode?"crosshair":"grab"}}
+              width={canvasSize.w}
+              height={canvasSize.h}
+              style={{display:"block",width:canvasSize.w+"px",height:canvasSize.h+"px",cursor:screen==="placing"?"crosshair":atkMode?"crosshair":"grab"}}
               onWheel={onWheel} onMouseDown={onMD} onMouseMove={onMM}
               onMouseUp={onMU} onMouseLeave={()=>{drag.current.on=false;setHoverCell(null);setHovPoi(null);}}
             />
